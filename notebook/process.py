@@ -47,9 +47,9 @@ logger.info("="*80)
 def parse_metabolomics_xlsx(
     file_path: str,
     header_row: int = 4
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> pd.DataFrame:
     """
-    Parse metabolomics Excel file and separate metadata and sample data columns.
+    Parse metabolomics Excel file.
     
     Parameters:
     -----------
@@ -60,34 +60,20 @@ def parse_metabolomics_xlsx(
     
     Returns:
     --------
-    tuple of (full_df, metadata_df, sample_data_df)
-        full_df: Complete dataframe with all columns
-        metadata_df: Dataframe with only metadata columns
-        sample_data_df: Dataframe with sample data columns (those containing 'CH_Algae')
+    pd.DataFrame
+        Complete dataframe with all columns
     
     Examples:
     ---------
-    >>> full_df, metadata_df, sample_df = parse_metabolomics_xlsx(
+    >>> df = parse_metabolomics_xlsx(
     ...     'data/raw/20251126_CH_Algae_T3_metabolomes_NEG_Area.xlsx'
     ... )
-    >>> print(f"Total columns: {len(full_df.columns)}")
-    >>> print(f"Metadata columns: {len(metadata_df.columns)}")
-    >>> print(f"Sample columns: {len(sample_df.columns)}")
+    >>> print(f"Total columns: {len(df.columns)}")
     """
     # Read the Excel file with proper header
     df = pd.read_excel(file_path, header=header_row)
     
-    # Identify sample columns (those containing 'CH_Algae' in the name)
-    sample_columns = [col for col in df.columns if 'CH_Algae' in str(col)]
-    
-    # Identify metadata columns (all columns except sample columns)
-    metadata_columns = [col for col in df.columns if col not in sample_columns]
-    
-    # Create separate dataframes
-    metadata_df = df[metadata_columns].copy()
-    sample_data_df = df[sample_columns].copy()
-    
-    return df, metadata_df, sample_data_df
+    return df
 
 # %%
 def classify_carbohydrates(
@@ -226,7 +212,7 @@ def process_metabolomics_file(
     file_path: str,
     header_row: int = 4,
     inchikey_column: str = 'INCHIKEY'
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> pd.DataFrame:
     """
     Complete processing pipeline: parse file and classify carbohydrates.
     
@@ -243,26 +229,24 @@ def process_metabolomics_file(
     
     Returns:
     --------
-    tuple of (full_df, classified_metadata_df, sample_data_df)
-        full_df: Complete dataframe with all columns
-        classified_metadata_df: Metadata with carbohydrate classification columns
-        sample_data_df: Sample data columns
+    pd.DataFrame
+        Complete dataframe with carbohydrate classification columns added
     
     Examples:
     ---------
-    >>> full_df, metadata_df, sample_df = process_metabolomics_file(
+    >>> df = process_metabolomics_file(
     ...     'data/raw/20251126_CH_Algae_T3_metabolomes_NEG_Area.xlsx'
     ... )
-    >>> carb_count = metadata_df['Is Carbohydrate'].sum()
+    >>> carb_count = df['Is Carbohydrate'].sum()
     >>> print(f"Found {carb_count} carbohydrates")
     """
     # Parse the file
-    full_df, metadata_df, sample_data_df = parse_metabolomics_xlsx(file_path, header_row)
+    df = parse_metabolomics_xlsx(file_path, header_row)
     
     # Classify carbohydrates using InChIKey
-    classified_metadata_df = classify_carbohydrates(metadata_df, inchikey_column)
+    classified_df = classify_carbohydrates(df, inchikey_column)
     
-    return full_df, classified_metadata_df, sample_data_df
+    return classified_df
 
 # %%
 # Example usage
@@ -313,24 +297,23 @@ if __name__ == '__main__':
         
         try:
             logger.info(f"Calling process_metabolomics_file for {file_path}")
-            full_df, metadata_df, sample_df = process_metabolomics_file(file_path)
+            df = process_metabolomics_file(file_path)
             
-            logger.info(f"File structure - Total: {len(full_df.columns)}, Metadata: {len(metadata_df.columns)}, Sample: {len(sample_df.columns)}")
+            logger.info(f"File structure - Total columns: {len(df.columns)}, Total rows: {len(df)}")
             print(f"\nFile structure:")
-            print(f"  Total columns: {len(full_df.columns)}")
-            print(f"  Metadata columns: {len(metadata_df.columns)}")
-            print(f"  Sample columns: {len(sample_df.columns)}")
+            print(f"  Total columns: {len(df.columns)}")
+            print(f"  Total rows: {len(df)}")
             
-            carb_count = metadata_df['Is Carbohydrate'].sum()
-            logger.info(f"Metabolite classification - Total: {len(metadata_df)}, Carbohydrates: {carb_count}")
+            carb_count = df['Is Carbohydrate'].sum()
+            logger.info(f"Metabolite classification - Total: {len(df)}, Carbohydrates: {carb_count}")
             print(f"\nMetabolite classification:")
-            print(f"  Total metabolites: {len(metadata_df)}")
+            print(f"  Total metabolites: {len(df)}")
             print(f"  Carbohydrates found: {carb_count}")
             total_carbohydrates += carb_count
             
             if carb_count > 0:
                 print(f"\nCarbohydrate breakdown:")
-                class_counts = metadata_df[metadata_df['Is Carbohydrate']]['Main Class'].value_counts()
+                class_counts = df[df['Is Carbohydrate']]['Main Class'].value_counts()
                 for class_name, count in class_counts.items():
                     print(f"  {class_name}: {count}")
                     logger.info(f"  {class_name}: {count}")
@@ -338,21 +321,15 @@ if __name__ == '__main__':
             # Extract base filename without extension
             base_filename = os.path.splitext(os.path.basename(file_path))[0]
             
-            # Save classified metadata
-            metadata_output = os.path.join(output_dir, f"{base_filename}_classified_metadata.csv")
-            metadata_df.to_csv(metadata_output, index=False)
-            logger.info(f"Saved classified metadata to: {metadata_output}")
-            print(f"\n✓ Saved classified metadata to: {metadata_output}")
-            
-            # Save sample data
-            sample_output = os.path.join(output_dir, f"{base_filename}_sample_data.csv")
-            sample_df.to_csv(sample_output, index=False)
-            logger.info(f"Saved sample data to: {sample_output}")
-            print(f"✓ Saved sample data to: {sample_output}")
+            # Save classified data
+            classified_output = os.path.join(output_dir, f"{base_filename}_classified.csv")
+            df.to_csv(classified_output, index=False)
+            logger.info(f"Saved classified data to: {classified_output}")
+            print(f"\n✓ Saved classified data to: {classified_output}")
             
             # Save carbohydrates only (if any found)
             if carb_count > 0:
-                carb_only = metadata_df[metadata_df['Is Carbohydrate']].copy()
+                carb_only = df[df['Is Carbohydrate']].copy()
                 carb_output = os.path.join(output_dir, f"{base_filename}_carbohydrates_only.csv")
                 carb_only.to_csv(carb_output, index=False)
                 logger.info(f"Saved carbohydrates only to: {carb_output}")
