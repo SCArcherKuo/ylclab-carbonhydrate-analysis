@@ -9,6 +9,7 @@ import requests
 import json
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+from loguru import logger
 from . import config
 
 # Cache for ChEBI API responses to avoid repeated calls
@@ -97,14 +98,16 @@ class ChEBIClient:
         """
         # Check cache first
         if chebi_id in self.cache:
+            logger.debug(f"Cache hit for ChEBI children: {chebi_id}")
             return self.cache[chebi_id]
         
+        logger.debug(f"Fetching ChEBI children for {chebi_id}")
         try:
             url = f'{self.base_url}/ontology/children/{chebi_id}/'
             response = requests.get(url, headers={'accept': '*/*'}, timeout=self.timeout)
             
             if response.status_code != 200:
-                print(f"Warning: ChEBI API failed for {chebi_id}: HTTP {response.status_code}")
+                logger.warning(f"ChEBI API failed for {chebi_id}: HTTP {response.status_code}")
                 self.cache[chebi_id] = []
                 return []
             
@@ -113,6 +116,7 @@ class ChEBIClient:
             
             # Filter for "is a" relations (direct children)
             children = [rel for rel in incoming if rel.get('relation_type') == 'is a']
+            logger.debug(f"Found {len(children)} children for ChEBI {chebi_id}")
             
             self.cache[chebi_id] = children
             self._cache_dirty = True
@@ -125,8 +129,18 @@ class ChEBIClient:
             
             return children
             
+        except requests.exceptions.Timeout as e:
+            logger.error(f"Timeout fetching ChEBI children for {chebi_id}: {str(e)}")
+            self.cache[chebi_id] = []
+            self._cache_dirty = True
+            return []
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request error fetching ChEBI children for {chebi_id}: {str(e)}")
+            self.cache[chebi_id] = []
+            self._cache_dirty = True
+            return []
         except Exception as e:
-            print(f"Warning: Error fetching ChEBI children for {chebi_id}: {str(e)}")
+            logger.exception(f"Unexpected error fetching ChEBI children for {chebi_id}: {str(e)}")
             self.cache[chebi_id] = []
             self._cache_dirty = True
             return []
@@ -154,14 +168,16 @@ class ChEBIClient:
         """
         # Check cache first
         if chebi_id in self.parents_cache:
+            logger.debug(f"Cache hit for ChEBI parents: {chebi_id}")
             return self.parents_cache[chebi_id]
         
+        logger.debug(f"Fetching ChEBI parents for {chebi_id}")
         try:
             url = f'{self.base_url}/ontology/parents/{chebi_id}/'
             response = requests.get(url, headers={'accept': '*/*'}, timeout=self.timeout)
             
             if response.status_code != 200:
-                print(f"Warning: ChEBI API failed for {chebi_id}: HTTP {response.status_code}")
+                logger.warning(f"ChEBI API failed for {chebi_id}: HTTP {response.status_code}")
                 self.parents_cache[chebi_id] = []
                 return []
             
@@ -170,6 +186,7 @@ class ChEBIClient:
             
             # Filter for "is a" relations (direct parents)
             parents = [rel for rel in outgoing if rel.get('relation_type') == 'is a']
+            logger.debug(f"Found {len(parents)} parents for ChEBI {chebi_id}")
             
             self.parents_cache[chebi_id] = parents
             self._cache_dirty = True
@@ -183,8 +200,18 @@ class ChEBIClient:
             
             return parents
             
+        except requests.exceptions.Timeout as e:
+            logger.error(f"Timeout fetching ChEBI parents for {chebi_id}: {str(e)}")
+            self.parents_cache[chebi_id] = []
+            self._cache_dirty = True
+            return []
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request error fetching ChEBI parents for {chebi_id}: {str(e)}")
+            self.parents_cache[chebi_id] = []
+            self._cache_dirty = True
+            return []
         except Exception as e:
-            print(f"Warning: Error fetching ChEBI parents for {chebi_id}: {str(e)}")
+            logger.exception(f"Unexpected error fetching ChEBI parents for {chebi_id}: {str(e)}")
             self.parents_cache[chebi_id] = []
             self._cache_dirty = True
             return []
@@ -214,36 +241,46 @@ class ChEBIClient:
         """
         # Check cache first
         if chebi_id in self.ancestors_cache:
+            logger.debug(f"Cache hit for ChEBI ancestors: {chebi_id}")
             return self.ancestors_cache[chebi_id]
         
+        logger.debug(f"Computing all ancestors for ChEBI {chebi_id}")
         ancestors = set([chebi_id])  # Include self
         visited = set()
         queue = [chebi_id]
         depth = 0
         
-        while queue and depth < max_depth:
-            current_batch = queue[:]
-            queue = []
-            
-            for current_id in current_batch:
-                if current_id in visited:
-                    continue
-                visited.add(current_id)
+        try:
+            while queue and depth < max_depth:
+                current_batch = queue[:]
+                queue = []
                 
-                parents = self.get_parents(current_id)
-                for parent_rel in parents:
-                    parent_id = parent_rel.get('final_id')
-                    if parent_id and parent_id not in ancestors:
-                        ancestors.add(parent_id)
-                        queue.append(parent_id)
+                for current_id in current_batch:
+                    if current_id in visited:
+                        continue
+                    visited.add(current_id)
+                    
+                    parents = self.get_parents(current_id)
+                    for parent_rel in parents:
+                        parent_id = parent_rel.get('final_id')
+                        if parent_id and parent_id not in ancestors:
+                            ancestors.add(parent_id)
+                            queue.append(parent_id)
+                
+                depth += 1
             
-            depth += 1
-        
-        ancestor_list = sorted(list(ancestors))
-        self.ancestors_cache[chebi_id] = ancestor_list
-        self._cache_dirty = True
-        
-        return ancestor_list
+            ancestor_list = sorted(list(ancestors))
+            logger.debug(f"Found {len(ancestor_list)} ancestors for ChEBI {chebi_id}")
+            self.ancestors_cache[chebi_id] = ancestor_list
+            self._cache_dirty = True
+            
+            return ancestor_list
+            
+        except Exception as e:
+            logger.exception(f"Error computing ancestors for ChEBI {chebi_id}: {str(e)}")
+            # Return partial results if available
+            ancestor_list = sorted(list(ancestors))
+            return ancestor_list
     
     def get_main_groups(self, chebi_id: int) -> List[str]:
         """

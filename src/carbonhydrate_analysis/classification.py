@@ -6,6 +6,7 @@ their ChEBI ontology terms and hierarchical relationships.
 """
 
 from typing import List, Any, Tuple, Optional
+from loguru import logger
 from .chebi_api import get_chebi_children, get_main_groups, get_all_ancestors
 from .utils import extract_term_string
 from . import config
@@ -218,45 +219,65 @@ def classify_by_chebi_ancestry(chebi_id: int) -> Tuple[Optional[str], Optional[s
     >>> print(main_class, subclass)
     'main carbohydrate group' 'monosaccharide'
     """
-    # Get all ancestors
-    ancestors = get_all_ancestors(chebi_id)
+    logger.debug(f"Classifying ChEBI {chebi_id} by ancestry")
     
-    # Check if compound belongs to carbohydrates root (CHEBI:78616)
-    if config.CHEBI_ROOT_ID not in ancestors:
-        return None, None
-    
-    # Get main groups for carbohydrate and carbohydrate derivative
-    carb_main_groups = get_main_groups(config.CHEBI_CARBOHYDRATE_ID)
-    carb_deriv_main_groups = get_main_groups(config.CHEBI_CARBOHYDRATE_DERIVATIVE_ID)
-    
-    # Check if it's a carbohydrate (CHEBI:16646)
-    if config.CHEBI_CARBOHYDRATE_ID in ancestors:
-        return _classify_by_ancestry_path(
-            chebi_id, 
-            ancestors, 
-            config.CHEBI_CARBOHYDRATE_ID,
-            carb_main_groups,
-            'main carbohydrate group',
-            'other carbohydrate'
-        )
-    
-    # Check if it's a carbohydrate derivative (CHEBI:63299)
-    if config.CHEBI_CARBOHYDRATE_DERIVATIVE_ID in ancestors:
-        return _classify_by_ancestry_path(
-            chebi_id,
-            ancestors,
-            config.CHEBI_CARBOHYDRATE_DERIVATIVE_ID,
-            carb_deriv_main_groups,
-            'main carbohydrate derivative group',
-            'other carbohydrate derivative'
-        )
-    
-    # If under root but not in carbohydrate or carbohydrate derivative
-    root_children = get_chebi_children(config.CHEBI_ROOT_ID)
-    for child in root_children:
-        child_id = child.get('init_id')
-        if child_id and child_id in ancestors:
-            return 'other', child.get('init_name', 'carbohydrates and carbohydrate derivatives')
+    try:
+        # Get all ancestors
+        ancestors = get_all_ancestors(chebi_id)
+        logger.debug(f"ChEBI {chebi_id} has {len(ancestors)} ancestors")
+        
+        # Check if compound belongs to carbohydrates root (CHEBI:78616)
+        if config.CHEBI_ROOT_ID not in ancestors:
+            logger.debug(f"ChEBI {chebi_id} not under carbohydrate root")
+            return None, None
+        
+        logger.debug(f"ChEBI {chebi_id} is under carbohydrate root")
+        
+        # Get main groups for carbohydrate and carbohydrate derivative
+        carb_main_groups = get_main_groups(config.CHEBI_CARBOHYDRATE_ID)
+        carb_deriv_main_groups = get_main_groups(config.CHEBI_CARBOHYDRATE_DERIVATIVE_ID)
+        
+        # Check if it's a carbohydrate (CHEBI:16646)
+        if config.CHEBI_CARBOHYDRATE_ID in ancestors:
+            logger.debug(f"ChEBI {chebi_id} is a carbohydrate")
+            return _classify_by_ancestry_path(
+                chebi_id, 
+                ancestors, 
+                config.CHEBI_CARBOHYDRATE_ID,
+                carb_main_groups,
+                'main carbohydrate group',
+                'other carbohydrate'
+            )
+        
+        # Check if it's a carbohydrate derivative (CHEBI:63299)
+        if config.CHEBI_CARBOHYDRATE_DERIVATIVE_ID in ancestors:
+            logger.debug(f"ChEBI {chebi_id} is a carbohydrate derivative")
+            return _classify_by_ancestry_path(
+                chebi_id,
+                ancestors,
+                config.CHEBI_CARBOHYDRATE_DERIVATIVE_ID,
+                carb_deriv_main_groups,
+                'main carbohydrate derivative group',
+                'other carbohydrate derivative'
+            )
+        
+        # If under root but not in carbohydrate or carbohydrate derivative
+        logger.debug(f"ChEBI {chebi_id} under root but not carbohydrate or derivative")
+        root_children = get_chebi_children(config.CHEBI_ROOT_ID)
+        for child in root_children:
+            child_id = child.get('init_id')
+            if child_id and child_id in ancestors:
+                result = ('other', child.get('init_name', 'carbohydrates and carbohydrate derivatives'))
+                logger.debug(f"ChEBI {chebi_id} classified as: {result}")
+                return result
+        
+        result = ('other', 'carbohydrates and carbohydrate derivatives')
+        logger.debug(f"ChEBI {chebi_id} classified as: {result}")
+        return result
+        
+    except Exception as e:
+        logger.exception(f"Error classifying ChEBI {chebi_id} by ancestry: {str(e)}")
+        raise
     
     return 'other', 'carbohydrates and carbohydrate derivatives'
 
