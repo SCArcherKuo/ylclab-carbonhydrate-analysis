@@ -9,7 +9,11 @@ import requests
 import json
 import time
 import re
-from typing import List, Dict, Any, Union, Optional
+import os
+from pathlib import Path
+from collections import deque
+from datetime import datetime
+from typing import List, Dict, Any, Union, Optional, Tuple
 from tqdm import tqdm
 from loguru import logger
 from . import config
@@ -43,6 +47,97 @@ class PubChemClient:
         self.rate_limit_delay = rate_limit_delay or config.RATE_LIMIT_DELAY
         self.max_synonyms = config.MAX_SYNONYMS
         self.chunk_size = 512
+        
+        # Retry configuration
+        self.max_retries = config.MAX_RETRIES
+        self.retry_delay = config.RETRY_DELAY
+        self.retry_backoff = config.RETRY_BACKOFF
+        
+        # Server error tracking (for adaptive sleep)
+        self.server_error_times: deque = deque(maxlen=100)  # Track last 100 server errors
+        self.server_error_threshold = config.SERVER_ERROR_THRESHOLD
+        self.server_error_window = config.SERVER_ERROR_WINDOW
+        self.server_error_sleep_time = config.SERVER_ERROR_SLEEP_TIME
+        
+        # Failed identifiers tracking
+        self.failed_identifiers: Dict[str, List[str]] = {}
+        self.failed_cids: List[int] = []
+    
+    # =========================================================================
+    # Error Tracking and Adaptive Sleep
+    # =========================================================================
+    
+    def _record_server_error(self) -> None:
+        """Record a server error occurrence and check if we should sleep."""
+        current_time = time.time()
+        self.server_error_times.append(current_time)
+        
+        # Check if we have too many errors in the recent window
+        recent_errors = sum(1 for t in self.server_error_times 
+                          if current_time - t <= self.server_error_window)
+        
+        if recent_errors >= self.server_error_threshold:
+            logger.warning(
+                f"Detected {recent_errors} server errors in the last {self.server_error_window}s. "
+                f"Sleeping for {self.server_error_sleep_time}s to avoid overwhelming the server..."
+            )
+            print(f"\n⚠️  Too many server errors detected. Sleeping for {self.server_error_sleep_time // 60} minutes...")
+            time.sleep(self.server_error_sleep_time)
+            # Clear the error history after sleeping
+            self.server_error_times.clear()
+            logger.info("Resuming after adaptive sleep")
+            print("Resuming processing...")
+    
+    def _save_failed_identifiers(self, identifier_type: str) -> None:
+        """Save failed identifiers to a JSON file for later retry."""
+        if not self.failed_identifiers.get(identifier_type):
+            return
+        
+        # Create cache directory if it doesn't exist
+        cache_dir = Path(config.FAILED_IDENTIFIERS_DIR)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = cache_dir / f"failed_{identifier_type}s_{timestamp}.json"
+        
+        failed_data = {
+            "timestamp": timestamp,
+            "identifier_type": identifier_type,
+            "count": len(self.failed_identifiers[identifier_type]),
+            "identifiers": self.failed_identifiers[identifier_type]
+        }
+        
+        with open(filename, 'w') as f:
+            json.dump(failed_data, f, indent=2)
+        
+        logger.info(f"Saved {len(self.failed_identifiers[identifier_type])} failed {identifier_type}s to {filename}")
+        print(f"\n💾 Saved {len(self.failed_identifiers[identifier_type])} failed {identifier_type}s to {filename}")
+    
+    def _save_failed_cids(self) -> None:
+        """Save failed CIDs to a JSON file for later retry."""
+        if not self.failed_cids:
+            return
+        
+        # Create cache directory if it doesn't exist
+        cache_dir = Path(config.FAILED_IDENTIFIERS_DIR)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create filename with timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = cache_dir / f"failed_cids_{timestamp}.json"
+        
+        failed_data = {
+            "timestamp": timestamp,
+            "count": len(self.failed_cids),
+            "cids": self.failed_cids
+        }
+        
+        with open(filename, 'w') as f:
+            json.dump(failed_data, f, indent=2)
+        
+        logger.info(f"Saved {len(self.failed_cids)} failed CIDs to {filename}")
+        print(f"\n💾 Saved {len(self.failed_cids)} failed CIDs to {filename}")
     
     # =========================================================================
     # Identifier Resolution
@@ -50,7 +145,7 @@ class PubChemClient:
     
     def resolve_identifier_to_cid(self, identifier: str, identifier_type: str) -> Optional[int]:
         """
-        Resolve an identifier (InChIKey or SMILES) to a PubChem CID.
+        Resolve an identifier (InChIKey or SMILES) to a PubChem CID with retry logic.
         
         Parameters:
         -----------
@@ -69,33 +164,65 @@ class PubChemClient:
         headers = {'Content-Type': 'application/x-www-form-urlencoded'}
         payload = f"{identifier_type}={identifier}"
         
-        try:
-            response = requests.post(search_url, data=payload, headers=headers, timeout=self.timeout)
-            
-            if response.status_code == 200:
-                data = response.json()
-                if 'IdentifierList' in data and 'CID' in data['IdentifierList']:
-                    cids = data['IdentifierList']['CID']
-                    if cids:
-                        logger.debug(f"Resolved {identifier[:30]}... -> CID {cids[0]}")
-                        return cids[0]  # Take first CID
-            elif response.status_code == 429:
-                retry_after = response.headers.get('Retry-After', 'unknown')
-                logger.error(f"RATE LIMIT EXCEEDED for {identifier_type}: {identifier[:30]}... (Retry-After: {retry_after}s)")
-            elif response.status_code >= 500:
-                logger.error(f"Server error (HTTP {response.status_code}) for {identifier_type}: {identifier[:30]}...")
-            else:
-                logger.warning(f"No CID found for {identifier_type}: {identifier[:30]}... (HTTP {response.status_code})")
-            return None
-        except requests.exceptions.Timeout as e:
-            logger.error(f"Timeout resolving {identifier_type} {identifier[:30]}...: {str(e)}")
-            return None
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Request error resolving {identifier_type} {identifier[:30]}...: {str(e)}")
-            return None
-        except Exception as e:
-            logger.exception(f"Unexpected error resolving identifier {identifier[:30]}...: {str(e)}")
-            return None
+        for attempt in range(self.max_retries):
+            try:
+                response = requests.post(search_url, data=payload, headers=headers, timeout=self.timeout)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    if 'IdentifierList' in data and 'CID' in data['IdentifierList']:
+                        cids = data['IdentifierList']['CID']
+                        if cids:
+                            logger.debug(f"Resolved {identifier[:30]}... -> CID {cids[0]}")
+                            return cids[0]  # Take first CID
+                elif response.status_code == 429:
+                    retry_after = response.headers.get('Retry-After', 'unknown')
+                    logger.error(f"RATE LIMIT EXCEEDED for {identifier_type}: {identifier[:30]}... (Retry-After: {retry_after}s)")
+                    return None  # Don't retry rate limits
+                elif response.status_code >= 500:
+                    logger.error(f"Server error (HTTP {response.status_code}) for {identifier_type}: {identifier[:30]}... (attempt {attempt + 1}/{self.max_retries})")
+                    self._record_server_error()
+                    if attempt < self.max_retries - 1:
+                        delay = self.retry_delay * (self.retry_backoff ** attempt)
+                        logger.info(f"Retrying in {delay:.1f}s...")
+                        time.sleep(delay)
+                        continue
+                    else:
+                        # Max retries exceeded, mark as failed
+                        if identifier_type not in self.failed_identifiers:
+                            self.failed_identifiers[identifier_type] = []
+                        self.failed_identifiers[identifier_type].append(identifier)
+                        logger.warning(f"Max retries exceeded for {identifier_type}: {identifier[:30]}...")
+                else:
+                    logger.warning(f"No CID found for {identifier_type}: {identifier[:30]}... (HTTP {response.status_code})")
+                return None
+            except requests.exceptions.Timeout as e:
+                logger.error(f"Timeout resolving {identifier_type} {identifier[:30]}... (attempt {attempt + 1}/{self.max_retries}): {str(e)}")
+                if attempt < self.max_retries - 1:
+                    delay = self.retry_delay * (self.retry_backoff ** attempt)
+                    time.sleep(delay)
+                    continue
+                else:
+                    if identifier_type not in self.failed_identifiers:
+                        self.failed_identifiers[identifier_type] = []
+                    self.failed_identifiers[identifier_type].append(identifier)
+                return None
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Request error resolving {identifier_type} {identifier[:30]}... (attempt {attempt + 1}/{self.max_retries}): {str(e)}")
+                if attempt < self.max_retries - 1:
+                    delay = self.retry_delay * (self.retry_backoff ** attempt)
+                    time.sleep(delay)
+                    continue
+                else:
+                    if identifier_type not in self.failed_identifiers:
+                        self.failed_identifiers[identifier_type] = []
+                    self.failed_identifiers[identifier_type].append(identifier)
+                return None
+            except Exception as e:
+                logger.exception(f"Unexpected error resolving identifier {identifier[:30]}...: {str(e)}")
+                return None
+        
+        return None
     
     def resolve_identifiers_to_cids(
         self,
@@ -133,6 +260,9 @@ class PubChemClient:
             # Small delay to avoid rate limiting
             time.sleep(0.1)
         
+        # Save any failed identifiers
+        self._save_failed_identifiers(identifier_type)
+        
         return identifier_to_cid
     
     # =========================================================================
@@ -163,43 +293,72 @@ class PubChemClient:
             logger.debug(f"Processing chunk {chunk_num}/{total_chunks} ({len(chunk_cids)} CIDs)")
             cid_list = ','.join(map(str, chunk_cids))
             
-            try:
-                props_url = f"{self.base_url}/compound/cid/property/MolecularFormula,MolecularWeight,InChI,InChIKey,SMILES,IUPACName/JSON"
-                props_response = requests.post(
-                    props_url,
-                    data=f"cid={cid_list}",
-                    headers={'Content-Type': 'application/x-www-form-urlencoded'},
-                    timeout=self.timeout
-                )
-                
-                if props_response.status_code == 200:
-                    props_data = props_response.json()
-                    if 'PropertyTable' in props_data and 'Properties' in props_data['PropertyTable']:
-                        for props in props_data['PropertyTable']['Properties']:
-                            cid = props.get('CID')
-                            if cid:
-                                properties[cid] = props
-                        logger.debug(f"Successfully fetched properties for chunk {chunk_num}")
-                elif props_response.status_code == 429:
-                    retry_after = props_response.headers.get('Retry-After', 'unknown')
-                    logger.error(f"RATE LIMIT EXCEEDED for properties chunk {chunk_num} (Retry-After: {retry_after}s)")
-                elif props_response.status_code >= 500:
-                    logger.error(f"Server error (HTTP {props_response.status_code}) for properties chunk {chunk_num}")
-                else:
-                    logger.warning(f"Properties request failed for chunk {chunk_num}: HTTP {props_response.status_code}")
-            except requests.exceptions.Timeout as e:
-                logger.error(f"Timeout fetching properties for chunk {chunk_num}: {str(e)}")
-            except requests.exceptions.RequestException as e:
-                logger.error(f"Request error fetching properties for chunk {chunk_num}: {str(e)}")
-            except Exception as e:
-                logger.exception(f"Unexpected error fetching properties for chunk {chunk_num}: {str(e)}")
+            success = False
+            for attempt in range(self.max_retries):
+                try:
+                    props_url = f"{self.base_url}/compound/cid/property/MolecularFormula,MolecularWeight,InChI,InChIKey,SMILES,IUPACName/JSON"
+                    props_response = requests.post(
+                        props_url,
+                        data=f"cid={cid_list}",
+                        headers={'Content-Type': 'application/x-www-form-urlencoded'},
+                        timeout=self.timeout
+                    )
+                    
+                    if props_response.status_code == 200:
+                        props_data = props_response.json()
+                        if 'PropertyTable' in props_data and 'Properties' in props_data['PropertyTable']:
+                            for props in props_data['PropertyTable']['Properties']:
+                                cid = props.get('CID')
+                                if cid:
+                                    properties[cid] = props
+                            logger.debug(f"Successfully fetched properties for chunk {chunk_num}")
+                            success = True
+                            break
+                    elif props_response.status_code == 429:
+                        retry_after = props_response.headers.get('Retry-After', 'unknown')
+                        logger.error(f"RATE LIMIT EXCEEDED for properties chunk {chunk_num} (Retry-After: {retry_after}s)")
+                        break  # Don't retry rate limits
+                    elif props_response.status_code >= 500:
+                        logger.error(f"Server error (HTTP {props_response.status_code}) for properties chunk {chunk_num} (attempt {attempt + 1}/{self.max_retries})")
+                        self._record_server_error()
+                        if attempt < self.max_retries - 1:
+                            delay = self.retry_delay * (self.retry_backoff ** attempt)
+                            logger.info(f"Retrying chunk {chunk_num} in {delay:.1f}s...")
+                            time.sleep(delay)
+                            continue
+                        else:
+                            # Max retries exceeded, mark CIDs as failed
+                            self.failed_cids.extend(chunk_cids)
+                            logger.warning(f"Max retries exceeded for properties chunk {chunk_num}")
+                    else:
+                        logger.warning(f"Properties request failed for chunk {chunk_num}: HTTP {props_response.status_code}")
+                        break
+                except requests.exceptions.Timeout as e:
+                    logger.error(f"Timeout fetching properties for chunk {chunk_num} (attempt {attempt + 1}/{self.max_retries}): {str(e)}")
+                    if attempt < self.max_retries - 1:
+                        delay = self.retry_delay * (self.retry_backoff ** attempt)
+                        time.sleep(delay)
+                        continue
+                    else:
+                        self.failed_cids.extend(chunk_cids)
+                except requests.exceptions.RequestException as e:
+                    logger.error(f"Request error fetching properties for chunk {chunk_num} (attempt {attempt + 1}/{self.max_retries}): {str(e)}")
+                    if attempt < self.max_retries - 1:
+                        delay = self.retry_delay * (self.retry_backoff ** attempt)
+                        time.sleep(delay)
+                        continue
+                    else:
+                        self.failed_cids.extend(chunk_cids)
+                except Exception as e:
+                    logger.exception(f"Unexpected error fetching properties for chunk {chunk_num}: {str(e)}")
+                    break
         
         logger.info(f"Fetched properties for {len(properties)}/{len(cids)} CIDs")
         return properties
     
     def get_classification(self, cid: int) -> List[Dict[str, Any]]:
         """
-        Get classification hierarchies for a CID.
+        Get classification hierarchies for a CID with retry logic.
         
         Parameters:
         -----------
@@ -214,36 +373,61 @@ class PubChemClient:
         logger.debug(f"Fetching classification for CID {cid}")
         class_url = f"{self.base_url}/compound/cid/{cid}/classification/JSON"
         
-        try:
-            response = requests.get(class_url, timeout=self.timeout)
-            
-            if response.status_code == 200:
-                class_data = response.json()
-                if 'Hierarchies' in class_data and 'Hierarchy' in class_data['Hierarchies']:
-                    hierarchies = [h for h in class_data['Hierarchies']['Hierarchy'] if 'Node' in h]
-                    logger.debug(f"Found {len(hierarchies)} classification hierarchies for CID {cid}")
-                    return hierarchies
-            elif response.status_code == 429:
-                retry_after = response.headers.get('Retry-After', 'unknown')
-                logger.error(f"RATE LIMIT EXCEEDED for classification CID {cid} (Retry-After: {retry_after}s)")
-            elif response.status_code >= 500:
-                logger.error(f"Server error (HTTP {response.status_code}) for classification CID {cid}")
-            else:
-                logger.warning(f"No classification data for CID {cid}: HTTP {response.status_code}")
-        except json.JSONDecodeError as e:
-            logger.error(f"JSON decode error in classification for CID {cid}: {str(e)}")
-        except requests.exceptions.Timeout as e:
-            logger.error(f"Timeout fetching classification for CID {cid}: {str(e)}")
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Request error fetching classification for CID {cid}: {str(e)}")
-        except Exception as e:
-            logger.exception(f"Unexpected error fetching classification for CID {cid}: {str(e)}")
+        for attempt in range(self.max_retries):
+            try:
+                response = requests.get(class_url, timeout=self.timeout)
+                
+                if response.status_code == 200:
+                    class_data = response.json()
+                    if 'Hierarchies' in class_data and 'Hierarchy' in class_data['Hierarchies']:
+                        hierarchies = [h for h in class_data['Hierarchies']['Hierarchy'] if 'Node' in h]
+                        logger.debug(f"Found {len(hierarchies)} classification hierarchies for CID {cid}")
+                        return hierarchies
+                elif response.status_code == 429:
+                    retry_after = response.headers.get('Retry-After', 'unknown')
+                    logger.error(f"RATE LIMIT EXCEEDED for classification CID {cid} (Retry-After: {retry_after}s)")
+                    return []  # Don't retry rate limits
+                elif response.status_code >= 500:
+                    logger.error(f"Server error (HTTP {response.status_code}) for classification CID {cid} (attempt {attempt + 1}/{self.max_retries})")
+                    self._record_server_error()
+                    if attempt < self.max_retries - 1:
+                        delay = self.retry_delay * (self.retry_backoff ** attempt)
+                        logger.info(f"Retrying in {delay:.1f}s...")
+                        time.sleep(delay)
+                        continue
+                    else:
+                        self.failed_cids.append(cid)
+                else:
+                    logger.warning(f"No classification data for CID {cid}: HTTP {response.status_code}")
+                    return []
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON decode error in classification for CID {cid}: {str(e)}")
+                return []
+            except requests.exceptions.Timeout as e:
+                logger.error(f"Timeout fetching classification for CID {cid} (attempt {attempt + 1}/{self.max_retries}): {str(e)}")
+                if attempt < self.max_retries - 1:
+                    delay = self.retry_delay * (self.retry_backoff ** attempt)
+                    time.sleep(delay)
+                    continue
+                else:
+                    self.failed_cids.append(cid)
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Request error fetching classification for CID {cid} (attempt {attempt + 1}/{self.max_retries}): {str(e)}")
+                if attempt < self.max_retries - 1:
+                    delay = self.retry_delay * (self.retry_backoff ** attempt)
+                    time.sleep(delay)
+                    continue
+                else:
+                    self.failed_cids.append(cid)
+            except Exception as e:
+                logger.exception(f"Unexpected error fetching classification for CID {cid}: {str(e)}")
+                return []
         
         return []
     
     def get_synonyms(self, cid: int) -> List[str]:
         """
-        Get synonyms for a CID.
+        Get synonyms for a CID with retry logic.
         
         Parameters:
         -----------
@@ -258,29 +442,53 @@ class PubChemClient:
         logger.debug(f"Fetching synonyms for CID {cid}")
         syn_url = f"{self.base_url}/compound/cid/{cid}/synonyms/JSON"
         
-        try:
-            response = requests.get(syn_url, timeout=self.timeout)
-            
-            if response.status_code == 200:
-                syn_data = response.json()
-                if 'InformationList' in syn_data and 'Information' in syn_data['InformationList']:
-                    if len(syn_data['InformationList']['Information']) > 0:
-                        synonyms = syn_data['InformationList']['Information'][0].get('Synonym', [])
-                        logger.debug(f"Found {len(synonyms)} synonyms for CID {cid}")
-                        return synonyms
-            elif response.status_code == 429:
-                retry_after = response.headers.get('Retry-After', 'unknown')
-                logger.error(f"RATE LIMIT EXCEEDED for synonyms CID {cid} (Retry-After: {retry_after}s)")
-            elif response.status_code >= 500:
-                logger.error(f"Server error (HTTP {response.status_code}) for synonyms CID {cid}")
-            else:
-                logger.warning(f"No synonyms found for CID {cid}: HTTP {response.status_code}")
-        except requests.exceptions.Timeout as e:
-            logger.error(f"Timeout fetching synonyms for CID {cid}: {str(e)}")
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Request error fetching synonyms for CID {cid}: {str(e)}")
-        except Exception as e:
-            logger.exception(f"Unexpected error fetching synonyms for CID {cid}: {str(e)}")
+        for attempt in range(self.max_retries):
+            try:
+                response = requests.get(syn_url, timeout=self.timeout)
+                
+                if response.status_code == 200:
+                    syn_data = response.json()
+                    if 'InformationList' in syn_data and 'Information' in syn_data['InformationList']:
+                        if len(syn_data['InformationList']['Information']) > 0:
+                            synonyms = syn_data['InformationList']['Information'][0].get('Synonym', [])
+                            logger.debug(f"Found {len(synonyms)} synonyms for CID {cid}")
+                            return synonyms
+                elif response.status_code == 429:
+                    retry_after = response.headers.get('Retry-After', 'unknown')
+                    logger.error(f"RATE LIMIT EXCEEDED for synonyms CID {cid} (Retry-After: {retry_after}s)")
+                    return []  # Don't retry rate limits
+                elif response.status_code >= 500:
+                    logger.error(f"Server error (HTTP {response.status_code}) for synonyms CID {cid} (attempt {attempt + 1}/{self.max_retries})")
+                    self._record_server_error()
+                    if attempt < self.max_retries - 1:
+                        delay = self.retry_delay * (self.retry_backoff ** attempt)
+                        logger.info(f"Retrying in {delay:.1f}s...")
+                        time.sleep(delay)
+                        continue
+                    else:
+                        self.failed_cids.append(cid)
+                else:
+                    logger.warning(f"No synonyms found for CID {cid}: HTTP {response.status_code}")
+                    return []
+            except requests.exceptions.Timeout as e:
+                logger.error(f"Timeout fetching synonyms for CID {cid} (attempt {attempt + 1}/{self.max_retries}): {str(e)}")
+                if attempt < self.max_retries - 1:
+                    delay = self.retry_delay * (self.retry_backoff ** attempt)
+                    time.sleep(delay)
+                    continue
+                else:
+                    self.failed_cids.append(cid)
+            except requests.exceptions.RequestException as e:
+                logger.error(f"Request error fetching synonyms for CID {cid} (attempt {attempt + 1}/{self.max_retries}): {str(e)}")
+                if attempt < self.max_retries - 1:
+                    delay = self.retry_delay * (self.retry_backoff ** attempt)
+                    time.sleep(delay)
+                    continue
+                else:
+                    self.failed_cids.append(cid)
+            except Exception as e:
+                logger.exception(f"Unexpected error fetching synonyms for CID {cid}: {str(e)}")
+                return []
         
         return []
     
@@ -459,6 +667,10 @@ class PubChemClient:
                 continue
         
         logger.info(f"Batch processing complete: {len(results)}/{len(cids)} compounds processed successfully")
+        
+        # Save any failed CIDs
+        self._save_failed_cids()
+        
         return results
 
 

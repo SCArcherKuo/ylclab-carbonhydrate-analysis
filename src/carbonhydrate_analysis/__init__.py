@@ -9,6 +9,12 @@ from .pubchem_api import get_compound_info_pubchem, PubChemClient
 from .chebi_api import ChEBIClient, get_chebi_children, get_main_groups
 from .classification import CarbohydrateClassifier, classify_carbohydrate
 from .utils import extract_term_string, extract_ontology_terms_from_node
+from .retry_failed import (
+    list_failed_files,
+    load_failed_identifiers,
+    retry_failed_identifiers,
+    retry_failed_cids
+)
 
 __version__ = "0.1.0"
 
@@ -31,4 +37,10 @@ __all__ = [
     # Utilities
     'extract_term_string',
     'extract_ontology_terms_from_node',
+    
+    # Retry utilities
+    'list_failed_files',
+    'load_failed_identifiers',
+    'retry_failed_identifiers',
+    'retry_failed_cids',
 ]

@@ -19,6 +19,19 @@ API_TIMEOUT = 30
 # Rate limiting (seconds between requests)
 RATE_LIMIT_DELAY = 0.2
 
+# Retry configuration
+MAX_RETRIES = 3  # Maximum number of retries for server errors
+RETRY_DELAY = 2.0  # Initial delay between retries (seconds)
+RETRY_BACKOFF = 2.0  # Backoff multiplier for exponential backoff
+
+# Server error detection and adaptive sleep
+SERVER_ERROR_WINDOW = 60  # Time window in seconds to track server errors
+SERVER_ERROR_THRESHOLD = 10  # Number of server errors in window to trigger sleep
+SERVER_ERROR_SLEEP_TIME = 180  # Sleep time in seconds (3 minutes) when threshold exceeded
+
+# Failed identifiers storage
+FAILED_IDENTIFIERS_DIR = "data/cache"  # Directory to store failed identifiers
+
 # Result limits
 MAX_SYNONYMS = 20  # Maximum number of synonyms to return
 MAX_ONTOLOGY_DISPLAY = 10  # Maximum ontology terms to display by default
