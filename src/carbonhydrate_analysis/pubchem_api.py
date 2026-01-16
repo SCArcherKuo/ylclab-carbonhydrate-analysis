@@ -79,7 +79,13 @@ class PubChemClient:
                     if cids:
                         logger.debug(f"Resolved {identifier[:30]}... -> CID {cids[0]}")
                         return cids[0]  # Take first CID
-            logger.warning(f"No CID found for {identifier_type}: {identifier[:30]}... (HTTP {response.status_code})")
+            elif response.status_code == 429:
+                retry_after = response.headers.get('Retry-After', 'unknown')
+                logger.error(f"RATE LIMIT EXCEEDED for {identifier_type}: {identifier[:30]}... (Retry-After: {retry_after}s)")
+            elif response.status_code >= 500:
+                logger.error(f"Server error (HTTP {response.status_code}) for {identifier_type}: {identifier[:30]}...")
+            else:
+                logger.warning(f"No CID found for {identifier_type}: {identifier[:30]}... (HTTP {response.status_code})")
             return None
         except requests.exceptions.Timeout as e:
             logger.error(f"Timeout resolving {identifier_type} {identifier[:30]}...: {str(e)}")
@@ -174,6 +180,11 @@ class PubChemClient:
                             if cid:
                                 properties[cid] = props
                         logger.debug(f"Successfully fetched properties for chunk {chunk_num}")
+                elif props_response.status_code == 429:
+                    retry_after = props_response.headers.get('Retry-After', 'unknown')
+                    logger.error(f"RATE LIMIT EXCEEDED for properties chunk {chunk_num} (Retry-After: {retry_after}s)")
+                elif props_response.status_code >= 500:
+                    logger.error(f"Server error (HTTP {props_response.status_code}) for properties chunk {chunk_num}")
                 else:
                     logger.warning(f"Properties request failed for chunk {chunk_num}: HTTP {props_response.status_code}")
             except requests.exceptions.Timeout as e:
@@ -212,7 +223,13 @@ class PubChemClient:
                     hierarchies = [h for h in class_data['Hierarchies']['Hierarchy'] if 'Node' in h]
                     logger.debug(f"Found {len(hierarchies)} classification hierarchies for CID {cid}")
                     return hierarchies
-            logger.warning(f"No classification data for CID {cid}: HTTP {response.status_code}")
+            elif response.status_code == 429:
+                retry_after = response.headers.get('Retry-After', 'unknown')
+                logger.error(f"RATE LIMIT EXCEEDED for classification CID {cid} (Retry-After: {retry_after}s)")
+            elif response.status_code >= 500:
+                logger.error(f"Server error (HTTP {response.status_code}) for classification CID {cid}")
+            else:
+                logger.warning(f"No classification data for CID {cid}: HTTP {response.status_code}")
         except json.JSONDecodeError as e:
             logger.error(f"JSON decode error in classification for CID {cid}: {str(e)}")
         except requests.exceptions.Timeout as e:
@@ -251,7 +268,13 @@ class PubChemClient:
                         synonyms = syn_data['InformationList']['Information'][0].get('Synonym', [])
                         logger.debug(f"Found {len(synonyms)} synonyms for CID {cid}")
                         return synonyms
-            logger.warning(f"No synonyms found for CID {cid}: HTTP {response.status_code}")
+            elif response.status_code == 429:
+                retry_after = response.headers.get('Retry-After', 'unknown')
+                logger.error(f"RATE LIMIT EXCEEDED for synonyms CID {cid} (Retry-After: {retry_after}s)")
+            elif response.status_code >= 500:
+                logger.error(f"Server error (HTTP {response.status_code}) for synonyms CID {cid}")
+            else:
+                logger.warning(f"No synonyms found for CID {cid}: HTTP {response.status_code}")
         except requests.exceptions.Timeout as e:
             logger.error(f"Timeout fetching synonyms for CID {cid}: {str(e)}")
         except requests.exceptions.RequestException as e:

@@ -9,13 +9,91 @@ import requests
 import json
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+from collections import OrderedDict
 from loguru import logger
 from . import config
 
+
+class LRUCache:
+    """
+    Least Recently Used (LRU) cache with maximum size limit.
+    
+    Automatically evicts least recently used items when cache is full.
+    This prevents unbounded memory growth during long-running processes.
+    """
+    
+    def __init__(self, max_size: int = 200):
+        """
+        Initialize LRU cache.
+        
+        Parameters:
+        -----------
+        max_size : int
+            Maximum number of items to keep in cache (default: 200)
+        """
+        self.cache = OrderedDict()
+        self.max_size = max_size
+    
+    def get(self, key, default=None):
+        """Get value from cache, moving it to end (most recently used)."""
+        if key in self.cache:
+            # Move to end (most recent)
+            self.cache.move_to_end(key)
+            return self.cache[key]
+        return default
+    
+    def __getitem__(self, key):
+        """Dictionary-style access."""
+        value = self.get(key)
+        if value is None:
+            raise KeyError(key)
+        return value
+    
+    def __contains__(self, key):
+        """Check if key exists in cache."""
+        return key in self.cache
+    
+    def set(self, key, value):
+        """Set value in cache, evicting oldest item if cache is full."""
+        if key in self.cache:
+            # Update existing and move to end
+            self.cache.move_to_end(key)
+        self.cache[key] = value
+        
+        # Evict oldest item if over limit
+        if len(self.cache) > self.max_size:
+            self.cache.popitem(last=False)  # Remove first (oldest) item
+    
+    def __setitem__(self, key, value):
+        """Dictionary-style assignment."""
+        self.set(key, value)
+    
+    def clear(self):
+        """Clear all items from cache."""
+        self.cache.clear()
+    
+    def __len__(self):
+        """Return number of items in cache."""
+        return len(self.cache)
+    
+    def items(self):
+        """Return cache items."""
+        return self.cache.items()
+    
+    def keys(self):
+        """Return cache keys."""
+        return self.cache.keys()
+    
+    def values(self):
+        """Return cache values."""
+        return self.cache.values()
+
+
 # Cache for ChEBI API responses to avoid repeated calls
-_chebi_children_cache: Dict[int, List[Dict[str, Any]]] = {}
-_chebi_parents_cache: Dict[int, List[Dict[str, Any]]] = {}
-_chebi_ancestors_cache: Dict[int, List[int]] = {}
+# Using LRU cache to prevent unbounded memory growth
+_chebi_children_cache: LRUCache = LRUCache(max_size=200)
+_chebi_parents_cache: LRUCache = LRUCache(max_size=200)
+_chebi_ancestors_cache: LRUCache = LRUCache(max_size=200)
 
 
 class ChEBIClient:
@@ -59,7 +137,7 @@ class ChEBIClient:
         self.parents_cache_file = self.cache_dir / 'chebi_parents_cache.json'
         self.ancestors_cache_file = self.cache_dir / 'chebi_ancestors_cache.json'
         
-        # Use global caches for backward compatibility
+        # Use global LRU caches for backward compatibility
         self.cache = _chebi_children_cache
         self.parents_cache = _chebi_parents_cache
         self.ancestors_cache = _chebi_ancestors_cache
@@ -108,7 +186,7 @@ class ChEBIClient:
             
             if response.status_code != 200:
                 logger.warning(f"ChEBI API failed for {chebi_id}: HTTP {response.status_code}")
-                self.cache[chebi_id] = []
+                # Don't cache failures - allow retry on next call
                 return []
             
             data = response.json()
@@ -131,18 +209,15 @@ class ChEBIClient:
             
         except requests.exceptions.Timeout as e:
             logger.error(f"Timeout fetching ChEBI children for {chebi_id}: {str(e)}")
-            self.cache[chebi_id] = []
-            self._cache_dirty = True
+            # Don't cache errors - allow retry
             return []
         except requests.exceptions.RequestException as e:
             logger.error(f"Request error fetching ChEBI children for {chebi_id}: {str(e)}")
-            self.cache[chebi_id] = []
-            self._cache_dirty = True
+            # Don't cache errors - allow retry
             return []
         except Exception as e:
             logger.exception(f"Unexpected error fetching ChEBI children for {chebi_id}: {str(e)}")
-            self.cache[chebi_id] = []
-            self._cache_dirty = True
+            # Don't cache errors - allow retry
             return []
     
     def get_parents(self, chebi_id: int) -> List[Dict[str, Any]]:
@@ -178,7 +253,7 @@ class ChEBIClient:
             
             if response.status_code != 200:
                 logger.warning(f"ChEBI API failed for {chebi_id}: HTTP {response.status_code}")
-                self.parents_cache[chebi_id] = []
+                # Don't cache failures - allow retry on next call
                 return []
             
             data = response.json()
@@ -202,18 +277,15 @@ class ChEBIClient:
             
         except requests.exceptions.Timeout as e:
             logger.error(f"Timeout fetching ChEBI parents for {chebi_id}: {str(e)}")
-            self.parents_cache[chebi_id] = []
-            self._cache_dirty = True
+            # Don't cache errors - allow retry
             return []
         except requests.exceptions.RequestException as e:
             logger.error(f"Request error fetching ChEBI parents for {chebi_id}: {str(e)}")
-            self.parents_cache[chebi_id] = []
-            self._cache_dirty = True
+            # Don't cache errors - allow retry
             return []
         except Exception as e:
             logger.exception(f"Unexpected error fetching ChEBI parents for {chebi_id}: {str(e)}")
-            self.parents_cache[chebi_id] = []
-            self._cache_dirty = True
+            # Don't cache errors - allow retry
             return []
     
     def get_all_ancestors(self, chebi_id: int, max_depth: int = 20) -> List[int]:
@@ -338,9 +410,11 @@ class ChEBIClient:
             with open(self.cache_file, 'r', encoding='utf-8') as f:
                 cache_data = json.load(f)
             
-            # Convert string keys back to integers
+            # Convert string keys back to integers and load into LRU cache
+            # Only load non-empty results (don't load cached failures)
             for key_str, value in cache_data.items():
-                self.cache[int(key_str)] = value
+                if value:  # Skip empty lists
+                    self.cache.set(int(key_str), value)
             
             print(f"Loaded ChEBI children cache with {len(self.cache)} entries")
         except Exception as e:
@@ -355,9 +429,11 @@ class ChEBIClient:
             with open(self.parents_cache_file, 'r', encoding='utf-8') as f:
                 cache_data = json.load(f)
             
-            # Convert string keys back to integers
+            # Convert string keys back to integers and load into LRU cache
+            # Only load non-empty results (don't load cached failures)
             for key_str, value in cache_data.items():
-                self.parents_cache[int(key_str)] = value
+                if value:  # Skip empty lists
+                    self.parents_cache.set(int(key_str), value)
             
             print(f"Loaded ChEBI parents cache with {len(self.parents_cache)} entries")
         except Exception as e:
@@ -372,9 +448,11 @@ class ChEBIClient:
             with open(self.ancestors_cache_file, 'r', encoding='utf-8') as f:
                 cache_data = json.load(f)
             
-            # Convert string keys back to integers
+            # Convert string keys back to integers and load into LRU cache
+            # Only load non-empty results (don't load cached failures)
             for key_str, value in cache_data.items():
-                self.ancestors_cache[int(key_str)] = value
+                if value:  # Skip empty lists
+                    self.ancestors_cache.set(int(key_str), value)
             
             print(f"Loaded ChEBI ancestors cache with {len(self.ancestors_cache)} entries")
         except Exception as e:
@@ -395,7 +473,8 @@ class ChEBIClient:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
             
             # Convert integer keys to strings for JSON
-            cache_data = {str(key): value for key, value in self.cache.items()}
+            # Only save non-empty results (don't persist failures)
+            cache_data = {str(key): value for key, value in self.cache.items() if value}
             
             # Write to temporary file first, then rename for atomicity
             temp_file = self.cache_file.with_suffix('.tmp')
@@ -417,7 +496,8 @@ class ChEBIClient:
         
         try:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
-            cache_data = {str(key): value for key, value in self.parents_cache.items()}
+            # Only save non-empty results (don't persist failures)
+            cache_data = {str(key): value for key, value in self.parents_cache.items() if value}
             
             temp_file = self.parents_cache_file.with_suffix('.tmp')
             with open(temp_file, 'w', encoding='utf-8') as f:
@@ -435,7 +515,8 @@ class ChEBIClient:
         
         try:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
-            cache_data = {str(key): value for key, value in self.ancestors_cache.items()}
+            # Only save non-empty results (don't persist failures)
+            cache_data = {str(key): value for key, value in self.ancestors_cache.items() if value}
             
             temp_file = self.ancestors_cache_file.with_suffix('.tmp')
             with open(temp_file, 'w', encoding='utf-8') as f:

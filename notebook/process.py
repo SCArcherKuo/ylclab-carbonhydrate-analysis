@@ -171,10 +171,15 @@ def classify_carbohydrates(
     processed_count = 0
     failed_count = 0
     
+    # Disable progress bar if not in a TTY (avoids conflicts with nested tqdm and redirected output)
+    import sys
+    disable_outer_progress = not sys.stdout.isatty()
+    
     for inchikey, compound_info in tqdm(
         zip(unique_inchikeys, pubchem_results),
         total=len(unique_inchikeys),
-        desc="Classifying compounds"
+        desc="Classifying compounds",
+        disable=disable_outer_progress
     ):
         try:
             # Get all rows with this InChIKey
